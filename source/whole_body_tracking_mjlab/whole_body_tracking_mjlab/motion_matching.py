@@ -1,4 +1,4 @@
-"""Motion matching over a single reference clip, steered by forward/backward speed and yaw rate commands.
+"""Motion matching over a single reference clip, steered by planar velocity and yaw rate commands.
 
 The database is one training npz (``wbt-csv-to-npz`` output, e.g. the walking clip a tracking policy was trained on),
 so every generated frame is a frame of that clip, which the policy has learned to track. The matcher follows Holden's
@@ -19,9 +19,11 @@ Body poses and velocities come from forward kinematics on the robot model, in th
 
 from __future__ import annotations
 
-import mujoco
 import numpy as np
+from collections.abc import Mapping
 from dataclasses import dataclass
+
+import mujoco
 
 LN2 = float(np.log(2.0))
 
@@ -119,10 +121,13 @@ class MotionMatcherCfg:
     """Commands are clipped to the range the clip covers."""
     max_backward_speed: float = 0.3
     max_yaw_rate: float = 1.5
+    max_lateral_speed: float = 0.3
+    command_heading: bool = False
+    """Integrate the smoothed requested yaw rate for the reference heading instead of recorded yaw motion."""
 
 
 class MotionMatcher:
-    """Generates a reference motion frame by frame from (forward speed, yaw rate) commands.
+    """Generates a reference motion frame by frame from forward, lateral, and yaw-rate commands.
 
     ``reset`` and ``step`` return the reference frame as a dict with ``joint_pos`` and ``joint_vel`` (J,) in the npz's
     joint order and ``body_pos_w``, ``body_quat_w``, ``body_lin_vel_w``, ``body_ang_vel_w`` (B, 3 or 4) in its body
@@ -131,7 +136,7 @@ class MotionMatcher:
 
     def __init__(
         self,
-        motion_file: str,
+        motion_file: str | Mapping[str, np.ndarray],
         model: mujoco.MjModel,
         foot_body_names: tuple[str, str],
         cfg: MotionMatcherCfg = MotionMatcherCfg(),
@@ -140,7 +145,11 @@ class MotionMatcher:
         self.cfg = cfg
         self.model = model
         self.data = mujoco.MjData(model)
-        motion = np.load(motion_file)
+        if isinstance(motion_file, Mapping):
+            motion = motion_file
+        else:
+            with np.load(motion_file, allow_pickle=False) as archive:
+                motion = dict(archive)
         self.fps = float(motion["fps"][0])
         self.dt = 1.0 / self.fps
         self.joint_pos = motion["joint_pos"].astype(np.float64)
@@ -150,7 +159,8 @@ class MotionMatcher:
         body_lin_vel = motion["body_lin_vel_w"].astype(np.float64)
         self.num_frames = len(self.joint_pos)
 
-        # The npz stores every body and joint of the entity, in model order.
+        # Legacy npz files use model order. Named data (including ONNX exports)
+        # may reorder joints and contain only the tracked subset of bodies.
         prefix = f"{entity}/"
         self.body_names = [
             model.body(i).name[len(prefix) :] for i in range(model.nbody) if model.body(i).name.startswith(prefix)
@@ -171,16 +181,33 @@ class MotionMatcher:
         )
         self.root_qpos_adr = model.jnt_qposadr[free]
         self.root_dof_adr = model.jnt_dofadr[free]
-        if body_pos.shape[1] != len(self.body_names) or self.joint_pos.shape[1] != len(self.joint_names):
-            raise ValueError(
-                f"{motion_file} has {body_pos.shape[1]} bodies and {self.joint_pos.shape[1]} joints; the model has"
-                f" {len(self.body_names)} and {len(self.joint_names)}."
-            )
+        motion_bodies = list(motion.get("body_names", self.body_names))
+        motion_joints = list(motion.get("joint_names", self.joint_names))
+        if len(set(motion_bodies)) != len(motion_bodies) or len(set(motion_joints)) != len(motion_joints):
+            raise ValueError("Motion body and joint names must be unique.")
+        if set(motion_joints) != set(self.joint_names):
+            raise ValueError("Motion joint names do not match the robot.")
+        for key, shape in {
+            "joint_pos": (self.num_frames, len(motion_joints)),
+            "joint_vel": (self.num_frames, len(motion_joints)),
+            "body_pos_w": (self.num_frames, len(motion_bodies), 3),
+            "body_quat_w": (self.num_frames, len(motion_bodies), 4),
+            "body_lin_vel_w": (self.num_frames, len(motion_bodies), 3),
+        }.items():
+            if motion[key].shape != shape or not np.isfinite(motion[key]).all():
+                raise ValueError(f"Motion {key} must contain finite values with shape {shape}.")
+        required_bodies = {self.body_names[0], *foot_body_names}
+        if not required_bodies.issubset(motion_bodies):
+            raise ValueError(f"Motion is missing required bodies: {sorted(required_bodies - set(motion_bodies))}.")
+        joint_order = [motion_joints.index(name) for name in self.joint_names]
+        self.joint_pos = self.joint_pos[:, joint_order]
+        self.joint_vel = self.joint_vel[:, joint_order]
         if model.jnt_bodyid[free] != self.body_ids[0]:
             raise ValueError("The first body of the motion must be the floating base.")
 
         # Root channels. The root velocity of frame t moves the root from frame t-1 to t, in frame t-1's heading.
-        root_pos, root_quat = body_pos[:, 0], body_quat[:, 0]
+        root_idx = motion_bodies.index(self.body_names[0])
+        root_pos, root_quat = body_pos[:, root_idx], body_quat[:, root_idx]
         self.root_xy = root_pos[:, :2]
         self.root_yaw = np.unwrap(yaw_from_quat(root_quat))
         heading = quat_from_yaw(self.root_yaw)
@@ -204,7 +231,7 @@ class MotionMatcher:
         # Frames with the whole trajectory horizon inside the clip.
         self.num_valid = self.num_frames - horizon
         valid = np.arange(self.num_valid)
-        foot_ids = [self.body_names.index(name) for name in foot_body_names]
+        foot_ids = [motion_bodies.index(name) for name in foot_body_names]
         inv_heading = quat_conj(heading[valid])[:, None]
         root_offset = np.concatenate([self.root_xy[valid], np.zeros((self.num_valid, 1))], axis=-1)[:, None]
         foot_pos = quat_apply(inv_heading, body_pos[valid][:, foot_ids] - root_offset).reshape(self.num_valid, -1)
@@ -244,6 +271,36 @@ class MotionMatcher:
         self.min_jump = int(round(cfg.min_jump * self.fps))
         self.num_jumps = 0
 
+    @classmethod
+    def from_onnx(
+        cls,
+        path: str,
+        model: mujoco.MjModel,
+        foot_body_names: tuple[str, str],
+        fps: float,
+        cfg: MotionMatcherCfg = MotionMatcherCfg(),
+        entity: str = "robot",
+    ) -> MotionMatcher:
+        """Use an exported policy's embedded motion; its sample rate comes from the task config."""
+        import onnx
+        from onnx import numpy_helper
+
+        exported = onnx.load(path)
+        metadata = {p.key: p.value for p in exported.metadata_props}
+        keys = ("joint_pos", "joint_vel", "body_pos_w", "body_quat_w", "body_lin_vel_w")
+        motion = {
+            tensor.name.split(".")[0]: numpy_helper.to_array(tensor)
+            for tensor in exported.graph.initializer
+            if tensor.name.split(".")[0] in keys
+        }
+        missing = set(keys) - motion.keys()
+        if missing or not all(name in metadata for name in ("joint_names", "body_names")):
+            raise ValueError("ONNX has no complete named reference motion; provide --motion-file with a training npz.")
+        motion["fps"] = np.array([fps])
+        for key in ("joint_names", "body_names"):
+            motion[key] = np.array(metadata[key].split(","))
+        return cls(motion, model, foot_body_names, cfg, entity)
+
     # Commands.
 
     def clip_command(self, forward_speed: float, yaw_rate: float) -> tuple[float, float]:
@@ -254,17 +311,17 @@ class MotionMatcher:
         )
 
     def _advance_command_model(
-        self, vel: np.ndarray, yaw_rate: float, yaw: float, command: tuple[float, float]
+        self, vel: np.ndarray, yaw_rate: float, yaw: float, command: tuple[float, ...]
     ) -> tuple[np.ndarray, float, float]:
         """One step of the command model: world-frame velocity and yaw rate converge to the command."""
         alpha = 1.0 - np.exp(-LN2 * self.dt / self.cfg.command_halflife)
         yaw_rate += (command[1] - yaw_rate) * alpha
         yaw += yaw_rate * self.dt
-        target = rotate2d(np.array(yaw), np.array([command[0], 0.0]))
+        target = rotate2d(np.array(yaw), np.array([command[0], command[2] if len(command) > 2 else 0.0]))
         vel = vel + (target - vel) * alpha
         return vel, yaw_rate, yaw
 
-    def desired_trajectory(self, command: tuple[float, float]) -> np.ndarray:
+    def desired_trajectory(self, command: tuple[float, ...]) -> np.ndarray:
         """Trajectory features predicted by the command model from the current state, in the root's heading frame."""
         vel, yaw_rate, yaw = self.cmd_vel.copy(), self.cmd_yaw_rate, self.yaw
         pos = np.zeros(2)
@@ -290,15 +347,18 @@ class MotionMatcher:
         self.offsets = {k: (np.zeros_like(v), np.zeros_like(v)) for k, v in self._clip_velocities(frame).items()}
         self.channels = self._blended_channels()
         self.cmd_vel = rotate2d(np.array(self.yaw), self.root_vel[frame])
-        self.cmd_yaw_rate = float(self.root_yaw_rate[frame])
-        self.command = (0.0, 0.0)
+        self.cmd_yaw_rate = 0.0 if self.cfg.command_heading else float(self.root_yaw_rate[frame])
+        self.command = (0.0, 0.0, 0.0)
         self.frames_since_search = 0
         self.num_jumps = 0
         return self._forward_kinematics()
 
-    def step(self, forward_speed: float, yaw_rate: float) -> dict[str, np.ndarray]:
+    def step(self, forward_speed: float, yaw_rate: float, *, lateral_speed: float = 0.0) -> dict[str, np.ndarray]:
         """Advance one clip frame (1 / fps s) under the command and return the new reference frame."""
-        command = self.clip_command(forward_speed, yaw_rate)
+        command = (
+            *self.clip_command(forward_speed, yaw_rate),
+            float(np.clip(lateral_speed, -self.cfg.max_lateral_speed, self.cfg.max_lateral_speed)),
+        )
         self.cmd_vel, self.cmd_yaw_rate, _ = self._advance_command_model(
             self.cmd_vel, self.cmd_yaw_rate, self.yaw, command
         )
@@ -317,13 +377,16 @@ class MotionMatcher:
                 current = self._blended_channels()
         self.command = command
 
+        if self.cfg.command_heading:
+            current["root_yaw_rate"] = np.array([self.cmd_yaw_rate])
+
         # Integrate the root in its heading frame, like the clip's own root motion.
         self.xy = self.xy + rotate2d(np.array(self.yaw), current["root_vel"]) * self.dt
         self.yaw += float(current["root_yaw_rate"][0]) * self.dt
         self.channels = current
         return self._forward_kinematics()
 
-    def query(self, command: tuple[float, float]) -> np.ndarray:
+    def query(self, command: tuple[float, ...]) -> np.ndarray:
         frame = min(self.frame, self.num_valid - 1)
         pose = self.features[frame, : self.num_pose_features]
         trajectory = (
@@ -331,7 +394,7 @@ class MotionMatcher:
         ) * self.feature_scale[self.num_pose_features :]
         return np.concatenate([pose, trajectory])
 
-    def search(self, command: tuple[float, float]) -> int | None:
+    def search(self, command: tuple[float, ...]) -> int | None:
         """The frame to jump to, or None to keep playing."""
         costs = np.sum((self.features - self.query(command)) ** 2, axis=-1)
         current_cost = np.inf

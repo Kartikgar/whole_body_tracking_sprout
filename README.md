@@ -222,6 +222,74 @@ uv run wbt-motion-match Tracking-Flat-Sprout-Wo-State-Estimation-v0 --motion-fil
 | `--foot-body-names` | Feet for the matching features. Default: bodies matching `(left\|right)_(foot\|ankle_roll)_link` |
 | `--actuator-delay`, `--obs-delay`, `--viewer`, `--video-file`, `--start-frame` | As in `wbt-sim2sim` |
 
+## Browser-controlled walking
+
+`wbt-motion-match-browser` runs the ONNX policy in CPU MuJoCo and displays an interactive Viser scene in your browser.
+It starts paused. No desktop display, X11 forwarding, GPU rendering, or retargeting installation is needed.
+
+```bash
+uv run wbt-motion-match-browser Tracking-Flat-Sprout-Wo-State-Estimation-v0 \
+  --onnx-file /path/to/sprout_walk.onnx
+```
+
+Open `http://localhost:8080`, set a forward speed, and press **Play**. The ONNX's embedded motion is used as the matching
+database, with the policy rate from the selected task (50 Hz for the task above). The export must contain the root and
+both feet; body and joint metadata are used to handle the exported subset/order. Alternatively, pass
+`--motion-file /path/to/training_motion.npz`. Select the same task and robot model used to train the policy.
+
+| Control | Effect |
+|---|---|
+| Hold W / S or ↑ / ↓ | Walk forward at 0.4 m/s / backward at 0.2 m/s; release to clear |
+| Hold A / D or ← / → | Request left / right strafe at 0.2 m/s |
+| Hold Q / E | Turn left / right at 0.5 rad/s; combine with WASD |
+| Mouse | No scene controls or capture; the camera stays behind Sprout |
+| Forward/backward and left/right buttons | Adjust persistent commands by 0.1 m/s and 0.25 rad/s |
+| Sliders | Set forward speed, lateral speed, and turn rate directly |
+| Stop commands / Space | Clear all movement and turning commands |
+| Play/Pause / P | Start or freeze physics |
+| Reset / R | Restore the starting pose, clear commands and delays, and pause |
+
+For keyboard control, click the 3D scene and press **P** to play, then use **WASD** or the arrow keys. Click the scene
+again after editing a numeric input; shortcuts are inactive while typing into inputs. The camera stays behind the
+simulated robot with a damped chase camera. Position and heading ease into changes, with stronger filtering of vertical
+walking bob. The world stays fixed; reset snaps the camera to the starting pose. It cannot orbit, pan, or zoom.
+Mouse motion and the wheel have no effect on the scene, and the pointer is never captured. A/D request body-relative
+lateral velocity; Q/E request yaw. Diagonal translation is scaled to avoid a speed boost. The browser integrates the
+smoothed requested yaw into the reference heading, so strafing does not request a turn. Other matcher callers retain
+recorded heading motion unless `command_heading` is enabled.
+Keyboard commands clear on release, focus loss, or disconnect, and expire within 0.6 seconds if input stops arriving.
+
+Slider/button commands persist until changed; keyboard driving replaces them. The clip determines which motions are
+possible: zero velocity requests a stop but does
+not freeze the robot, and a walking clip may not reproduce every requested velocity. With the supplied Sprout walking
+export, lateral requests produce weak/inconsistent sidestepping in physics; reliable strafing needs a suitable motion
+database and policy. This export is a motion tracker: its command observation contains reference joint positions and
+velocities, not forward/lateral/yaw velocity requests. The matcher translates those browser requests into reference
+motion; adding a lateral UI control does not train a sidestep skill. The controls do not teleport the robot or force
+sideways physics velocities.
+Use **Pause** to freeze physics.
+If a training termination fires, the viewer pauses and reports the reason; **Reset** is required to continue.
+All connected browsers share one simulation and its controls. The simulation pauses when the last browser disconnects.
+
+For a remote machine, keep the default loopback bind and tunnel the port:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 -L 8081:127.0.0.1:8081 user@your-server
+```
+
+Or bind to a trusted private network address with `--host <private-ip> --port 8080` and open that address in the browser.
+Keyboard input uses a second WebSocket on `--keyboard-port` (default: viewer port + 1, normally 8081).
+Expose/tunnel both ports; the page displays a connection warning if keyboard input is unavailable. Keyboard connections
+use a per-viewer connection token. The adapter uses Viser's internal `RunJavascriptMessage` to install the bundled
+keyboard client; browser checks should be rerun when upgrading Viser. No installed Viser files are modified.
+
+The viewer has no authentication; anyone who can reach the port can control the shared simulation. It does not request
+a public sharing link. Robot models, checkpoints, and motion assets are supplied locally and are not included here.
+
+Asset-free motion-loader regression checks: `uv run python -m unittest discover -s tests -v`.
+To also exercise pause, reset, termination, and command limits against a local Sprout policy, set
+`WBT_TEST_ONNX=/path/to/sprout_walk.onnx` when running the checks. `WBT_TEST_TASK` can select another compatible task.
+
 ## Sprout
 
 The Sprout tasks run the same MDP on the Sprout humanoid (27 joints). Sprout's joints are driven by the vendor's DC motor
@@ -367,3 +435,12 @@ python scripts/rsl_rl/play.py --task=Tracking-Flat-G1-v0 --num_envs=2 --wandb_pa
 
 - **`scripts`**
   Includes utility scripts for preprocessing motion data, training policies, and evaluating trained policies.
+
+Browser input regression (with the server running):
+
+```bash
+uv run --no-project --with playwright --with msgspec python tests/browser_controls.py
+```
+
+Install Chromium with Playwright first, or set `WBT_CHROMIUM_EXECUTABLE` to an existing browser.
+`WBT_BROWSER_URL` defaults to `http://localhost:8080`. This check changes the shared simulation state.
